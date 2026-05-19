@@ -68,6 +68,11 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/terraform/v1/modules/{ns}/{name}/{provider}/{ver}/download",
             get(module_download),
         )
+        // Module source download (cached, proxied)
+        .route(
+            "/terraform/v1/modules/download/{ns}/{name}/{provider}/{ver}/source",
+            get(module_source_download),
+        )
 }
 
 // ── Service discovery ──────────────────────────────────────────────────
@@ -412,6 +417,7 @@ async fn module_versions(
 
 async fn module_download(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path((ns, name, provider, ver)): Path<(String, String, String, String)>,
 ) -> Response {
     if !is_valid_name(&ns)
@@ -420,6 +426,26 @@ async fn module_download(
         || !is_valid_version(&ver)
     {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let base_url = extract_base_url(&state, &headers);
+
+    // If we have a cached source URL, return the rewritten header immediately
+    let source_url_key = format!(
+        "terraform/modules/{}/{}/{}/{}/_source_url",
+        ns, name, provider, ver
+    );
+    if let Ok(data) = state.storage.get(&source_url_key).await {
+        let original_url = String::from_utf8_lossy(&data);
+        let rewritten =
+            rewrite_module_source_url(&original_url, &base_url, &ns, &name, &provider, &ver);
+        state.metrics.record_download("terraform");
+        state.metrics.record_cache_hit();
+        return (
+            StatusCode::NO_CONTENT,
+            [("x-terraform-get", rewritten.as_str())],
+        )
+            .into_response();
     }
 
     let proxy_url = upstream_url(&state);
@@ -446,6 +472,8 @@ async fn module_download(
     match request.send().await {
         Ok(response) => {
             if let Some(tf_get) = response.headers().get("x-terraform-get") {
+                let original_url = tf_get.to_str().unwrap_or("").to_string();
+
                 state.metrics.record_download("terraform");
                 state.activity.push(ActivityEntry::new(
                     ActionType::ProxyFetch,
@@ -454,10 +482,22 @@ async fn module_download(
                     "PROXY",
                 ));
 
-                // Pass through the X-Terraform-Get header
+                // Rewrite X-Terraform-Get to point through NORA (air-gap safe)
+                let rewritten = rewrite_module_source_url(
+                    &original_url,
+                    &base_url,
+                    &ns,
+                    &name,
+                    &provider,
+                    &ver,
+                );
+
+                // Cache the original upstream URL for module_source_download
+                state.spawn_cache("terraform", source_url_key, Bytes::from(original_url));
+
                 return (
                     StatusCode::NO_CONTENT,
-                    [("x-terraform-get", tf_get.to_str().unwrap_or(""))],
+                    [("x-terraform-get", rewritten.as_str())],
                 )
                     .into_response();
             }
@@ -465,6 +505,83 @@ async fn module_download(
         }
         Err(e) => {
             tracing::debug!(error = ?e, "Terraform module download error");
+            StatusCode::BAD_GATEWAY.into_response()
+        }
+    }
+}
+
+// ── Module source download (cached, proxied) ─────────────────────────
+
+async fn module_source_download(
+    State(state): State<Arc<AppState>>,
+    Path((ns, name, provider, ver)): Path<(String, String, String, String)>,
+) -> Response {
+    if !is_valid_name(&ns)
+        || !is_valid_name(&name)
+        || !is_valid_name(&provider)
+        || !is_valid_version(&ver)
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let storage_key = format!(
+        "terraform/modules/{}/{}/{}/{}/source.tar.gz",
+        ns, name, provider, ver
+    );
+
+    // Immutable: if cached, serve directly
+    if let Ok(data) = state.storage.get(&storage_key).await {
+        state.metrics.record_download("terraform");
+        state.metrics.record_cache_hit();
+        return with_binary(data.to_vec());
+    }
+
+    // Resolve original upstream URL from cached metadata
+    let source_url_key = format!(
+        "terraform/modules/{}/{}/{}/{}/_source_url",
+        ns, name, provider, ver
+    );
+    let upstream_url = match state.storage.get(&source_url_key).await {
+        Ok(data) => String::from_utf8_lossy(&data).to_string(),
+        Err(_) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
+
+    // Only proxy HTTP/HTTPS URLs (git:: or other schemes can't be proxied)
+    if !upstream_url.starts_with("http://") && !upstream_url.starts_with("https://") {
+        tracing::debug!(url = %upstream_url, "Module source URL is not HTTP — cannot proxy");
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    match proxy_fetch(
+        &state.http_client,
+        &upstream_url,
+        state.config.terraform.proxy_timeout_dl,
+        state.config.terraform.proxy_auth.as_deref(),
+        &state.circuit_breaker,
+        "terraform",
+    )
+    .await
+    {
+        Ok(bytes) => {
+            state.metrics.record_download("terraform");
+            state.metrics.record_cache_miss();
+            state.activity.push(ActivityEntry::new(
+                ActionType::ProxyFetch,
+                format!("{}/{}/{} v{}", ns, name, provider, ver),
+                "terraform",
+                "PROXY",
+            ));
+
+            // Immutable cache
+            state.spawn_cache_immutable("terraform", storage_key, Bytes::from(bytes.clone()));
+            with_binary(bytes)
+        }
+        Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
+        Err(e) => {
+            tracing::debug!(error = ?e, "Terraform module source download error");
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
@@ -524,12 +641,13 @@ async fn extract_terraform_publish_date(
     None
 }
 
-/// Resolve the real upstream download URL for a provider binary.
+/// Resolve the real upstream download URL for a provider file.
 ///
-/// Looks up the cached metadata JSON (`_nora_upstream_url` field saved by
-/// `rewrite_download_url`) to find the original URL (typically on
-/// releases.hashicorp.com). Falls back to constructing a
-/// releases.hashicorp.com URL from the path components.
+/// Looks up the cached metadata JSON to find the original URL (typically on
+/// releases.hashicorp.com). Checks `_nora_upstream_url` for binaries,
+/// `_nora_upstream_shasums_url` for SHA256SUMS, and
+/// `_nora_upstream_shasums_sig_url` for signature files.
+/// Falls back to constructing a releases.hashicorp.com URL from path components.
 async fn resolve_upstream_download_url(
     state: &AppState,
     ns: &str,
@@ -537,9 +655,16 @@ async fn resolve_upstream_download_url(
     ver: &str,
     filename: &str,
 ) -> String {
-    // Try every os/arch combo that might have cached metadata.
-    // The filename encodes os/arch: terraform-provider-{ptype}_{ver}_{os}_{arch}.zip
-    // Parse it to find the right metadata file directly.
+    // Determine which metadata field to look up based on filename
+    let meta_field = if filename.ends_with(".sig") {
+        "_nora_upstream_shasums_sig_url"
+    } else if filename.contains("SHA256SUMS") || filename.contains("SHA512SUMS") {
+        "_nora_upstream_shasums_url"
+    } else {
+        "_nora_upstream_url"
+    };
+
+    // For binary .zip files, parse os/arch from filename to find the right metadata
     if let Some((os, arch)) = parse_os_arch_from_filename(filename) {
         let meta_key = format!(
             "terraform/providers/{}/{}/{}/{}_{}.json",
@@ -547,8 +672,24 @@ async fn resolve_upstream_download_url(
         );
         if let Ok(data) = state.storage.get(&meta_key).await {
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
-                if let Some(url) = json.get("_nora_upstream_url").and_then(|v| v.as_str()) {
+                if let Some(url) = json.get(meta_field).and_then(|v| v.as_str()) {
                     return url.to_string();
+                }
+            }
+        }
+    } else {
+        // For shasums/sig files, scan any cached metadata for this provider version
+        // (shasums URLs are the same regardless of os/arch)
+        let prefix = format!("terraform/providers/{}/{}/{}/", ns, ptype, ver);
+        let keys = state.storage.list(&prefix).await;
+        for key in keys {
+            if key.ends_with(".json") {
+                if let Ok(data) = state.storage.get(&key).await {
+                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
+                        if let Some(url) = json.get(meta_field).and_then(|v| v.as_str()) {
+                            return url.to_string();
+                        }
+                    }
                 }
             }
         }
@@ -618,9 +759,10 @@ fn with_binary(data: Vec<u8>) -> Response {
         .into_response()
 }
 
-/// Rewrite download_url in provider metadata JSON to point through NORA.
+/// Rewrite download_url, shasums_url, and shasums_signature_url in provider
+/// metadata JSON to point through NORA.
 ///
-/// Also stores the original upstream URL in `_nora_upstream_url` so the
+/// Also stores the original upstream URLs in `_nora_upstream_*` fields so the
 /// binary download handler can fetch from the real host (e.g.
 /// releases.hashicorp.com) instead of the registry API endpoint.
 fn rewrite_download_url(
@@ -630,32 +772,95 @@ fn rewrite_download_url(
     ptype: &str,
     ver: &str,
 ) -> String {
-    // Parse JSON, find download_url, rewrite it
     if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(json_text) {
         if let Some(obj) = json.as_object_mut() {
-            if let Some(download_url) = obj.get("download_url").cloned() {
-                if let Some(url_str) = download_url.as_str() {
-                    // Preserve original upstream URL for the binary download handler
-                    obj.insert(
-                        "_nora_upstream_url".to_string(),
-                        serde_json::Value::String(url_str.to_string()),
-                    );
-                    // Extract filename from original URL
-                    let filename = url_str.rsplit('/').next().unwrap_or("provider.zip");
-                    let new_url = format!(
-                        "{}/terraform/v1/providers/download/{}/{}/{}/{}",
-                        base_url, ns, ptype, ver, filename
-                    );
-                    obj.insert(
-                        "download_url".to_string(),
-                        serde_json::Value::String(new_url),
-                    );
-                }
+            let download_base = format!(
+                "{}/terraform/v1/providers/download/{}/{}/{}",
+                base_url, ns, ptype, ver
+            );
+
+            // Rewrite download_url
+            if let Some(url_str) = obj
+                .get("download_url")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+            {
+                obj.insert(
+                    "_nora_upstream_url".to_string(),
+                    serde_json::Value::String(url_str.clone()),
+                );
+                let filename = url_str.rsplit('/').next().unwrap_or("provider.zip");
+                obj.insert(
+                    "download_url".to_string(),
+                    serde_json::Value::String(format!("{}/{}", download_base, filename)),
+                );
+            }
+
+            // Rewrite shasums_url
+            if let Some(url_str) = obj
+                .get("shasums_url")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+            {
+                obj.insert(
+                    "_nora_upstream_shasums_url".to_string(),
+                    serde_json::Value::String(url_str.clone()),
+                );
+                let filename = url_str.rsplit('/').next().unwrap_or("SHA256SUMS");
+                obj.insert(
+                    "shasums_url".to_string(),
+                    serde_json::Value::String(format!("{}/{}", download_base, filename)),
+                );
+            }
+
+            // Rewrite shasums_signature_url
+            if let Some(url_str) = obj
+                .get("shasums_signature_url")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+            {
+                obj.insert(
+                    "_nora_upstream_shasums_sig_url".to_string(),
+                    serde_json::Value::String(url_str.clone()),
+                );
+                let filename = url_str.rsplit('/').next().unwrap_or("SHA256SUMS.sig");
+                obj.insert(
+                    "shasums_signature_url".to_string(),
+                    serde_json::Value::String(format!("{}/{}", download_base, filename)),
+                );
             }
         }
         serde_json::to_string(&json).unwrap_or_else(|_| json_text.to_string())
     } else {
         json_text.to_string()
+    }
+}
+
+/// Rewrite X-Terraform-Get URL to point through NORA.
+///
+/// HTTP/HTTPS URLs are rewritten to NORA's module source proxy endpoint.
+/// Non-HTTP URLs (git::, hg::, relative paths) are returned as-is since
+/// they cannot be proxied through a simple HTTP cache.
+fn rewrite_module_source_url(
+    original_url: &str,
+    base_url: &str,
+    ns: &str,
+    name: &str,
+    provider: &str,
+    ver: &str,
+) -> String {
+    if original_url.starts_with("http://") || original_url.starts_with("https://") {
+        format!(
+            "{}/terraform/v1/modules/download/{}/{}/{}/{}/source",
+            base_url.trim_end_matches('/'),
+            ns,
+            name,
+            provider,
+            ver
+        )
+    } else {
+        // git::, hg::, s3::, relative paths — pass through as-is
+        original_url.to_string()
     }
 }
 
@@ -752,6 +957,53 @@ mod tests {
         assert!(is_safe_path("hashicorp/aws/5.0.0/provider.zip"));
         assert!(!is_safe_path("../../etc/passwd"));
         assert!(!is_safe_path("/absolute/path"));
+    }
+
+    #[test]
+    fn test_rewrite_module_source_url_http() {
+        let result = rewrite_module_source_url(
+            "https://codeload.github.com/hashicorp/terraform-aws-consul/tar.gz/v0.1.0",
+            "http://nora:4000",
+            "hashicorp",
+            "consul",
+            "aws",
+            "0.1.0",
+        );
+        assert_eq!(
+            result,
+            "http://nora:4000/terraform/v1/modules/download/hashicorp/consul/aws/0.1.0/source"
+        );
+        assert!(!result.contains("github.com"), "upstream URL must not leak");
+    }
+
+    #[test]
+    fn test_rewrite_module_source_url_git_passthrough() {
+        let git_url = "git::https://example.com/module.git";
+        let result = rewrite_module_source_url(
+            git_url,
+            "http://nora:4000",
+            "hashicorp",
+            "consul",
+            "aws",
+            "0.1.0",
+        );
+        assert_eq!(result, git_url, "git:: URLs should pass through unchanged");
+    }
+
+    #[test]
+    fn test_rewrite_module_source_url_relative_passthrough() {
+        let result = rewrite_module_source_url(
+            "./modules/foo",
+            "http://nora:4000",
+            "hashicorp",
+            "consul",
+            "aws",
+            "0.1.0",
+        );
+        assert_eq!(
+            result, "./modules/foo",
+            "relative paths should pass through"
+        );
     }
 }
 
@@ -852,6 +1104,79 @@ mod integration_tests {
         )
         .await;
         assert!(resp.status() == StatusCode::NOT_FOUND || resp.status() == StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_terraform_module_download_rewrites_cached_source_url() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.terraform.enabled = true;
+        });
+
+        // Seed the source URL metadata (as if module_download had cached it)
+        ctx.state
+            .storage
+            .put(
+                "terraform/modules/hashicorp/consul/aws/0.1.0/_source_url",
+                b"https://codeload.github.com/hashicorp/terraform-aws-consul/tar.gz/v0.1.0",
+            )
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/modules/hashicorp/consul/aws/0.1.0/download",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let tf_get = resp
+            .headers()
+            .get("x-terraform-get")
+            .expect("must have x-terraform-get header")
+            .to_str()
+            .unwrap();
+
+        // Must point through NORA, not upstream
+        assert!(
+            tf_get.contains("/terraform/v1/modules/download/"),
+            "X-Terraform-Get must point through NORA, got: {}",
+            tf_get
+        );
+        assert!(
+            !tf_get.contains("github.com"),
+            "X-Terraform-Get must not leak upstream URL, got: {}",
+            tf_get
+        );
+    }
+
+    #[tokio::test]
+    async fn test_terraform_module_source_from_cache() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.terraform.enabled = true;
+        });
+
+        // Seed cached module source tarball
+        ctx.state
+            .storage
+            .put(
+                "terraform/modules/hashicorp/consul/aws/0.1.0/source.tar.gz",
+                b"fake-tarball-content",
+            )
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/modules/download/hashicorp/consul/aws/0.1.0/source",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        assert_eq!(&body[..], b"fake-tarball-content");
     }
 
     #[tokio::test]

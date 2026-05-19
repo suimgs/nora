@@ -754,6 +754,258 @@ fi
 echo ""
 
 # ===========================================================================
+# 8. Cargo ETag + HTTP 304 (#396)
+# ===========================================================================
+echo "--- 8. Cargo ETag + HTTP 304 ---"
+
+start_nora env
+
+# Seed the Cargo sparse index directly in storage.
+# ETag is computed on sparse index responses (not config.json).
+# Crate name "etagtest" (8 chars) → prefix: et/ag/etagtest
+mkdir -p "$STORAGE_DIR/cargo/index/et/ag"
+echo '{"name":"etagtest","vers":"0.1.0","deps":[],"cksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","features":{}}' \
+    > "$STORAGE_DIR/cargo/index/et/ag/etagtest"
+
+# 8.1 Sparse index entry returns ETag header
+INDEX_RESP=$(curl -sf -D - "$BASE/cargo/index/et/ag/etagtest" 2>/dev/null || echo "")
+ETAG=$(echo "$INDEX_RESP" | grep -i "^etag:" | tr -d '\r' | head -1 || echo "")
+if [ -n "$ETAG" ]; then
+    pass "Cargo sparse index has ETag header"
+    ETAG_VALUE=$(echo "$ETAG" | sed 's/^[Ee][Tt][Aa][Gg]: *//')
+
+    # 8.2 Conditional request with If-None-Match returns 304
+    CODE_304=$(curl -s -o /dev/null -w "%{http_code}" \
+        -H "If-None-Match: $ETAG_VALUE" \
+        "$BASE/cargo/index/et/ag/etagtest")
+    if [ "$CODE_304" = "304" ]; then
+        pass "Cargo 304 Not Modified on matching ETag"
+    else
+        fail "Cargo expected 304, got $CODE_304"
+    fi
+
+    # 8.3 Wrong ETag returns 200 with full body
+    CODE_200=$(curl -s -o /dev/null -w "%{http_code}" \
+        -H 'If-None-Match: "wrong-etag"' \
+        "$BASE/cargo/index/et/ag/etagtest")
+    if [ "$CODE_200" = "200" ]; then
+        pass "Cargo 200 on mismatched ETag"
+    else
+        fail "Cargo expected 200 on wrong ETag, got $CODE_200"
+    fi
+
+    # 8.4 304 response has no body (bandwidth saving)
+    BODY_304=$(curl -s -H "If-None-Match: $ETAG_VALUE" "$BASE/cargo/index/et/ag/etagtest")
+    if [ -z "$BODY_304" ]; then
+        pass "Cargo 304 has empty body (bandwidth saved)"
+    else
+        fail "Cargo 304 returned body (${#BODY_304} bytes)"
+    fi
+else
+    fail "Cargo sparse index missing ETag header"
+    skip "Cargo 304 (no ETag to test)"
+    skip "Cargo 200 on mismatch (no ETag to test)"
+    skip "Cargo 304 empty body (no ETag to test)"
+fi
+
+echo ""
+
+# ===========================================================================
+# 9. NuGet URL Rewrite (#377, #392-#395)
+# ===========================================================================
+echo "--- 9. NuGet URL Rewrite ---"
+
+# NuGet URL rewrite needs a proxy upstream to test rewriting.
+# In local-only mode (no upstream), the service index is generated from config
+# but @id URLs are already NORA-local. The real test is when upstream data is
+# present. We test the invariant: no api.nuget.org in any NuGet response.
+
+# 9.1 Service index must not contain upstream URLs
+SVC_BODY=$(curl -sf "$BASE/nuget/v3/index.json" 2>/dev/null || echo "")
+if [ -n "$SVC_BODY" ]; then
+    if echo "$SVC_BODY" | grep -qi "api.nuget.org"; then
+        fail "NuGet service index leaks api.nuget.org URLs"
+    else
+        pass "NuGet service index: no upstream URL leak"
+    fi
+
+    # 9.2 All @id URLs point to NORA (or are relative)
+    NORA_URLS=$(echo "$SVC_BODY" | python3 -c "
+import sys,json
+try:
+    data = json.load(sys.stdin)
+    for r in data.get('resources', []):
+        url = r.get('@id', '')
+        if url: print(url)
+except: pass
+" 2>/dev/null || echo "")
+    if [ -n "$NORA_URLS" ]; then
+        LEAK_COUNT=$(echo "$NORA_URLS" | grep -cv "localhost\|127.0.0.1\|/nuget" || true)
+        if [ "$LEAK_COUNT" -eq 0 ]; then
+            pass "NuGet service index: all @id URLs rewritten to NORA"
+        else
+            fail "NuGet service index: $LEAK_COUNT @id URLs not rewritten"
+        fi
+    else
+        skip "NuGet @id URL check (no resources found)"
+    fi
+
+    # 9.3 No .nuget.org in any URL across the entire response
+    if echo "$SVC_BODY" | grep -qi "\.nuget\.org"; then
+        fail "NuGet service index contains .nuget.org reference"
+    else
+        pass "NuGet service index: no .nuget.org references"
+    fi
+else
+    skip "NuGet service index (not available)"
+    skip "NuGet @id URL check (not available)"
+    skip "NuGet .nuget.org leak check (not available)"
+fi
+
+echo ""
+
+# ===========================================================================
+# 10. PyPI PEP 691 Compliance (#389, #390)
+# ===========================================================================
+echo "--- 10. PyPI PEP 691 Compliance ---"
+
+# Seed PyPI storage directly (upload endpoint uses multipart POST, not PUT).
+# Storage layout: pypi/{name}/{filename} + pypi/{name}/{filename}.sha256
+PYPI_PKG="polygon-test-pkg"
+PYPI_FILE="polygon_test_pkg-1.0.tar.gz"
+PYPI_HASH="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+mkdir -p "$STORAGE_DIR/pypi/${PYPI_PKG}"
+echo "fake-pypi-tarball" > "$STORAGE_DIR/pypi/${PYPI_PKG}/${PYPI_FILE}"
+echo -n "$PYPI_HASH" > "$STORAGE_DIR/pypi/${PYPI_PKG}/${PYPI_FILE}.sha256"
+
+# Request PEP 691 JSON format
+PYPI_HEADERS=$(mktemp)
+PYPI_RESP=$(curl -sf -D "$PYPI_HEADERS" \
+    -H "Accept: application/vnd.pypi.simple.v1+json" \
+    "$BASE/simple/${PYPI_PKG}/" 2>/dev/null || echo "")
+
+if [ -n "$PYPI_RESP" ]; then
+    # 10.1 Content-Type is PEP 691
+    PYPI_CT=$(grep -i "^content-type:" "$PYPI_HEADERS" | tr -d '\r' || echo "")
+    if echo "$PYPI_CT" | grep -qi "application/vnd.pypi.simple"; then
+        pass "PyPI Content-Type is PEP 691"
+    else
+        fail "PyPI Content-Type: $PYPI_CT (expected vnd.pypi.simple)"
+    fi
+
+    # 10.2 Uses "hashes" not "digests" (#389)
+    if echo "$PYPI_RESP" | python3 -c "
+import sys,json
+data = json.load(sys.stdin)
+files = data.get('files', [])
+for f in files:
+    if 'digests' in f:
+        sys.exit(1)  # BUG: old field name
+sys.exit(0)
+" 2>/dev/null; then
+        pass "PyPI uses 'hashes' not 'digests' (PEP 691)"
+    else
+        fail "PyPI still uses 'digests' field (should be 'hashes' per PEP 691)"
+    fi
+
+    # 10.3 meta.api-version present
+    API_VER=$(echo "$PYPI_RESP" | python3 -c "
+import sys,json
+data = json.load(sys.stdin)
+print(data.get('meta', {}).get('api-version', ''))
+" 2>/dev/null || echo "")
+    if [ "$API_VER" = "1.0" ]; then
+        pass "PyPI meta.api-version = 1.0"
+    else
+        fail "PyPI meta.api-version = '$API_VER' (expected 1.0)"
+    fi
+
+    # 10.4 File URLs point to NORA, not pypi.org
+    PYPI_URLS=$(echo "$PYPI_RESP" | python3 -c "
+import sys,json
+data = json.load(sys.stdin)
+for f in data.get('files', []):
+    url = f.get('url', '')
+    if url: print(url)
+" 2>/dev/null || echo "")
+    if [ -n "$PYPI_URLS" ]; then
+        if echo "$PYPI_URLS" | grep -q "pypi.org"; then
+            fail "PyPI file URLs leak pypi.org"
+        else
+            pass "PyPI file URLs point to NORA"
+        fi
+    else
+        skip "PyPI URL check (no files in response)"
+    fi
+else
+    fail "PyPI PEP 691 returned no response for locally-seeded package"
+    skip "PyPI hashes field (no response)"
+    skip "PyPI api-version (no response)"
+    skip "PyPI URL check (no response)"
+fi
+
+rm -f "$PYPI_HEADERS"
+echo ""
+
+# 11. Terraform X-Terraform-Get URL Rewrite (#380)
+# Verifies that module download endpoint rewrites X-Terraform-Get
+# to point through NORA instead of leaking upstream URLs.
+echo "--- 11. Terraform X-Terraform-Get Rewrite (#380) ---"
+
+# Restart NORA with Terraform enabled
+start_nora env NORA_TF_ENABLED=true
+
+# Seed a module source URL metadata (simulates upstream module download response)
+TF_NS="hashicorp"
+TF_MOD="consul"
+TF_PROV="aws"
+TF_VER="0.1.0"
+TF_SOURCE_URL="https://codeload.github.com/hashicorp/terraform-aws-consul/tar.gz/v0.1.0"
+mkdir -p "$STORAGE_DIR/terraform/modules/${TF_NS}/${TF_MOD}/${TF_PROV}/${TF_VER}"
+echo -n "$TF_SOURCE_URL" > "$STORAGE_DIR/terraform/modules/${TF_NS}/${TF_MOD}/${TF_PROV}/${TF_VER}/_source_url"
+
+# 11.1 Module download endpoint returns rewritten X-Terraform-Get header
+TF_RESP=$(curl -sf -D - \
+    "${BASE}/terraform/v1/modules/${TF_NS}/${TF_MOD}/${TF_PROV}/${TF_VER}/download" \
+    2>/dev/null || echo "")
+TF_GET_HEADER=$(echo "$TF_RESP" | grep -i "^x-terraform-get:" | tr -d '\r' | head -1 || echo "")
+
+if [ -n "$TF_GET_HEADER" ]; then
+    pass "Terraform module download returns X-Terraform-Get header"
+else
+    fail "Terraform module download missing X-Terraform-Get header"
+fi
+
+# 11.2 X-Terraform-Get must NOT contain upstream URL (air-gap check)
+if echo "$TF_GET_HEADER" | grep -qi "github.com"; then
+    fail "Terraform X-Terraform-Get leaks upstream github.com URL"
+elif echo "$TF_GET_HEADER" | grep -qi "codeload"; then
+    fail "Terraform X-Terraform-Get leaks upstream codeload URL"
+else
+    pass "Terraform X-Terraform-Get does not leak upstream URLs"
+fi
+
+# 11.3 X-Terraform-Get must point through NORA
+if echo "$TF_GET_HEADER" | grep -q "/terraform/v1/modules/download/"; then
+    pass "Terraform X-Terraform-Get points through NORA proxy"
+else
+    fail "Terraform X-Terraform-Get does not point through NORA: $TF_GET_HEADER"
+fi
+
+# 11.4 Module source endpoint serves cached content
+echo -n "fake-module-tarball" > "$STORAGE_DIR/terraform/modules/${TF_NS}/${TF_MOD}/${TF_PROV}/${TF_VER}/source.tar.gz"
+TF_SOURCE_RESP=$(curl -sf \
+    "${BASE}/terraform/v1/modules/download/${TF_NS}/${TF_MOD}/${TF_PROV}/${TF_VER}/source" \
+    2>/dev/null || echo "")
+if [ "$TF_SOURCE_RESP" = "fake-module-tarball" ]; then
+    pass "Terraform module source served from NORA cache"
+else
+    fail "Terraform module source not served correctly: got '$TF_SOURCE_RESP'"
+fi
+
+echo ""
+
+# ===========================================================================
 # Summary
 # ===========================================================================
 echo "================================"
