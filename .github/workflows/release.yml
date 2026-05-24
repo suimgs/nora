@@ -22,6 +22,11 @@ jobs:
       id-token: write  # Sigstore cosign keyless signing
 
     steps:
+      - name: Clean up Docker resources
+        run: |
+          docker system prune -af --volumes || true
+          echo "Disk after cleanup: $(df -h / | tail -1 | awk '{print $4 " free"}')"
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Get short SHA and version
@@ -193,6 +198,12 @@ jobs:
           curl -sf http://localhost:5555/health
           docker stop nora-smoke
 
+      - name: Clean up Docker resources
+        if: always()
+        run: |
+          docker system prune -af --volumes || true
+          echo "Disk after cleanup: $(df -h / | tail -1 | awk '{print $4 " free"}')"
+
   package:
     name: Package (${{ matrix.format }}-${{ matrix.arch }})
     runs-on: [self-hosted, nora]
@@ -275,8 +286,6 @@ jobs:
             suffix: ""
           - name: redos
             suffix: "-redos"
-          - name: astra
-            suffix: "-astra"
 
     steps:
       - name: Set version tag (strip leading v)
