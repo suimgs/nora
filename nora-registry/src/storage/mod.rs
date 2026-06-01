@@ -13,8 +13,10 @@ use crate::validation::{validate_storage_key, ValidationError};
 use async_trait::async_trait;
 use axum::body::Bytes;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::io::AsyncRead;
 
 /// File metadata
 #[derive(Debug, Clone)]
@@ -60,6 +62,15 @@ pub trait StorageBackend: Send + Sync {
     /// S3 backend: multipart upload from file.
     /// The caller is responsible for deleting `src` on error.
     async fn put_from_path(&self, key: &str, src: &Path) -> Result<()>;
+
+    /// Open an artifact for streaming read without loading it into memory (#580).
+    ///
+    /// Returns `(size_bytes, reader)`. The caller converts the reader to a
+    /// streaming HTTP response via `ReaderStream` + `Body::from_stream()`.
+    ///
+    /// Local backend: `tokio::fs::File::open` + metadata.
+    /// S3 backend: `object_store::get` → byte-stream wrapped in `StreamReader`.
+    async fn get_reader(&self, key: &str) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)>;
 }
 
 /// Storage wrapper for dynamic dispatch with integrity verification.
@@ -227,18 +238,55 @@ impl Storage {
 
     /// Move or copy a file from `src` into storage under `key`.
     ///
-    /// Digest is assumed already verified by the caller — pin store is
-    /// not updated (re-reading gigabytes just to hash is wasteful).
-    pub async fn put_from_path(&self, key: &str, src: &Path) -> Result<()> {
+    /// When `sha256` is `Some`, the hash is recorded in the pin store without
+    /// re-reading the file — used by streaming download paths where the hash
+    /// was already computed incrementally (#580).
+    ///
+    /// When `sha256` is `None`, the pin store is not updated (legacy behavior
+    /// for callers that have already verified integrity separately).
+    pub async fn put_from_path(&self, key: &str, src: &Path, sha256: Option<&str>) -> Result<()> {
         validate_storage_key(key)?;
         match self.inner.put_from_path(key, src).await {
             Ok(()) => {
                 STORAGE_OPERATIONS.with_label_values(&["put", "ok"]).inc();
+                if let (Some(hash), Some(ref pins)) = (sha256, &self.pin_store) {
+                    let pins = Arc::clone(pins);
+                    let key = key.to_string();
+                    let hash = hash.to_string();
+                    tokio::task::spawn_blocking(move || pins.record_hash(&key, &hash));
+                }
                 Ok(())
             }
             Err(e) => {
                 STORAGE_OPERATIONS
                     .with_label_values(&["put", "error"])
+                    .inc();
+                Err(e)
+            }
+        }
+    }
+
+    /// Open an artifact for streaming read without loading into memory (#580).
+    ///
+    /// Returns `(size_bytes, reader)`. Pin-store integrity is NOT checked here
+    /// because streaming prevents full-data hashing. Callers that need integrity
+    /// verification should use `verify_integrity_by_hash` with the content digest
+    /// (available from the URL for Docker blobs).
+    pub async fn get_reader(
+        &self,
+        key: &str,
+    ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+        validate_storage_key(key)?;
+        match self.inner.get_reader(key).await {
+            Ok(reader) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["get_reader", "ok"])
+                    .inc();
+                Ok(reader)
+            }
+            Err(e) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["get_reader", "error"])
                     .inc();
                 Err(e)
             }
