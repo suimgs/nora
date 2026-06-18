@@ -357,6 +357,30 @@ async fn provider_download_binary(
             "terraform",
             "CACHE",
         ));
+        let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+            state.config.curation.terraform.quarantine.as_ref().or(state
+                .config
+                .curation
+                .quarantine
+                .as_ref()),
+            state
+                .config
+                .curation
+                .terraform
+                .quarantine_ttl
+                .as_deref()
+                .or(state.config.curation.quarantine_ttl.as_deref()),
+        );
+        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+            &state.digest_store,
+            "terraform",
+            &data,
+            &q_mode,
+            q_secs,
+            "cache",
+        ) {
+            return resp;
+        }
         return with_binary(data.to_vec());
     }
 
@@ -398,6 +422,30 @@ async fn provider_download_binary(
 
             // Immutable cache
             state.spawn_cache_immutable("terraform", storage_key, Bytes::from(bytes.clone()));
+            let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+                state.config.curation.terraform.quarantine.as_ref().or(state
+                    .config
+                    .curation
+                    .quarantine
+                    .as_ref()),
+                state
+                    .config
+                    .curation
+                    .terraform
+                    .quarantine_ttl
+                    .as_deref()
+                    .or(state.config.curation.quarantine_ttl.as_deref()),
+            );
+            if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                &state.digest_store,
+                "terraform",
+                &bytes,
+                &q_mode,
+                q_secs,
+                &url,
+            ) {
+                return resp;
+            }
             with_binary(bytes)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -634,6 +682,30 @@ async fn module_source_download(
         };
         state.metrics.record_download("terraform");
         state.metrics.record_cache_hit("terraform");
+        let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+            state.config.curation.terraform.quarantine.as_ref().or(state
+                .config
+                .curation
+                .quarantine
+                .as_ref()),
+            state
+                .config
+                .curation
+                .terraform
+                .quarantine_ttl
+                .as_deref()
+                .or(state.config.curation.quarantine_ttl.as_deref()),
+        );
+        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+            &state.digest_store,
+            "terraform",
+            &data,
+            &q_mode,
+            q_secs,
+            "cache",
+        ) {
+            return resp;
+        }
         return with_binary(data.to_vec());
     }
 
@@ -677,6 +749,30 @@ async fn module_source_download(
 
             // Immutable cache
             state.spawn_cache_immutable("terraform", storage_key, Bytes::from(bytes.clone()));
+            let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+                state.config.curation.terraform.quarantine.as_ref().or(state
+                    .config
+                    .curation
+                    .quarantine
+                    .as_ref()),
+                state
+                    .config
+                    .curation
+                    .terraform
+                    .quarantine_ttl
+                    .as_deref()
+                    .or(state.config.curation.quarantine_ttl.as_deref()),
+            );
+            if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                &state.digest_store,
+                "terraform",
+                &bytes,
+                &q_mode,
+                q_secs,
+                &upstream_url,
+            ) {
+                return resp;
+            }
             with_binary(bytes)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),

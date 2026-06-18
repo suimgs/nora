@@ -321,6 +321,30 @@ async fn download_tarball(
             "ansible",
             "CACHE",
         ));
+        let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+            state.config.curation.ansible.quarantine.as_ref().or(state
+                .config
+                .curation
+                .quarantine
+                .as_ref()),
+            state
+                .config
+                .curation
+                .ansible
+                .quarantine_ttl
+                .as_deref()
+                .or(state.config.curation.quarantine_ttl.as_deref()),
+        );
+        if let Some(resp) = crate::digest_quarantine::proxy_gate(
+            &state.digest_store,
+            "ansible",
+            &data,
+            &q_mode,
+            q_secs,
+            "cache",
+        ) {
+            return resp;
+        }
         return with_binary(data.to_vec());
     }
 
@@ -368,6 +392,30 @@ async fn download_tarball(
                 .log(AuditEntry::new("proxy_fetch", "api", "", "ansible", ""));
 
             state.spawn_cache_immutable("ansible", storage_key, Bytes::from(bytes.clone()));
+            let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
+                state.config.curation.ansible.quarantine.as_ref().or(state
+                    .config
+                    .curation
+                    .quarantine
+                    .as_ref()),
+                state
+                    .config
+                    .curation
+                    .ansible
+                    .quarantine_ttl
+                    .as_deref()
+                    .or(state.config.curation.quarantine_ttl.as_deref()),
+            );
+            if let Some(resp) = crate::digest_quarantine::proxy_gate(
+                &state.digest_store,
+                "ansible",
+                &bytes,
+                &q_mode,
+                q_secs,
+                &url,
+            ) {
+                return resp;
+            }
             with_binary(bytes)
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
