@@ -1369,31 +1369,56 @@ mod tests {
         assert_eq!(config.storage.mode, StorageMode::Local);
     }
 
-    /// Invariant: the field-level `#[serde(default)]` path and the `Default` impl
-    /// must produce identical values. `Config` derives `Default` (so `Config::default()`
-    /// is compiler-generated from each field's `Default`), leaving the `default_*`
-    /// helpers as the single root; the only way a default can drift is a
-    /// `serde(default = ...)` helper diverging from a type's `Default` impl — this
-    /// test fails loudly if that ever happens.
+    /// Assert that a config section's field-level serde-default path equals its
+    /// `Default` impl — i.e. writing `[section]` with no keys behaves the same as
+    /// omitting the section entirely. A bare `#[serde(default)]` on an `Option`
+    /// field yields `None`, which silently diverges from a `Default` impl that
+    /// returns `Some(..)` (the npm/pypi proxy bug). Comparison via
+    /// `serde_json::Value` tolerates `ProtectedString` secrets (`skip_serializing`
+    /// → absent on both sides) and auto-covers future fields.
+    fn assert_serde_default_eq_default<T>(section: &str)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + Default,
+    {
+        let from_empty: T = toml::from_str("").unwrap_or_else(|e| {
+            panic!(
+                "[{section}] empty table must deserialize — every field needs a serde default: {e}"
+            )
+        });
+        assert_eq!(
+            serde_json::to_value(&from_empty).unwrap(),
+            serde_json::to_value(T::default()).unwrap(),
+            "[{section}]: serde field-defaults diverge from the Default impl — a present-but-empty \
+             [{section}] table behaves differently from omitting the section",
+        );
+    }
+
+    /// Invariant (whole class, not just the leaves that were caught): for EVERY
+    /// config section, the field-level `#[serde(default)]` path and the `Default`
+    /// impl must agree, so `[section]` with no keys == omitting `[section]`. The
+    /// only way to drift is a `serde(default = ...)`/`Default` mismatch — this
+    /// fails loudly if it ever happens. Previously this only covered
+    /// server/storage, which let the npm/pypi `proxy` divergence through.
     #[test]
     fn test_serde_defaults_match_default_impl() {
-        // [server]: derived PartialEq gives exhaustive, future-field-proof coverage.
-        let from_empty: ServerConfig = toml::from_str("").unwrap();
-        assert_eq!(from_empty, ServerConfig::default());
+        assert_serde_default_eq_default::<ServerConfig>("server");
+        assert_serde_default_eq_default::<StorageConfig>("storage");
+        // All 13 registries — this is where the proxy-default class lives.
+        assert_serde_default_eq_default::<MavenConfig>("maven");
+        assert_serde_default_eq_default::<NpmConfig>("npm");
+        assert_serde_default_eq_default::<PypiConfig>("pypi");
+        assert_serde_default_eq_default::<DockerConfig>("docker");
+        assert_serde_default_eq_default::<GoConfig>("go");
+        assert_serde_default_eq_default::<CargoConfig>("cargo");
+        assert_serde_default_eq_default::<RawConfig>("raw");
+        assert_serde_default_eq_default::<GemsConfig>("gems");
+        assert_serde_default_eq_default::<TerraformConfig>("terraform");
+        assert_serde_default_eq_default::<AnsibleConfig>("ansible");
+        assert_serde_default_eq_default::<NugetConfig>("nuget");
+        assert_serde_default_eq_default::<PubDartConfig>("pub_dart");
+        assert_serde_default_eq_default::<ConanConfig>("conan");
 
-        // [storage]: ProtectedString does not implement PartialEq, so compare the
-        // comparable fields explicitly and assert the secret fields stay unset.
-        let s: StorageConfig = toml::from_str("").unwrap();
-        let d = StorageConfig::default();
-        assert_eq!(s.mode, d.mode);
-        assert_eq!(s.path, d.path);
-        assert_eq!(s.s3_url, d.s3_url);
-        assert_eq!(s.bucket, d.bucket);
-        assert_eq!(s.s3_region, d.s3_region);
-        assert!(s.s3_access_key.is_none() && d.s3_access_key.is_none());
-        assert!(s.s3_secret_key.is_none() && d.s3_secret_key.is_none());
-
-        // And the whole-Config fallback agrees with deserializing an empty file.
+        // Whole-Config fallback agrees with deserializing an empty file.
         let from_empty_cfg: Config = toml::from_str("").unwrap();
         assert_eq!(from_empty_cfg.server, ServerConfig::default());
     }
