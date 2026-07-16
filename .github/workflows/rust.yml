@@ -1,0 +1,65 @@
+name: Build Windows x64 (Rust)
+
+on:
+  workflow_dispatch: # 支持手动点击按钮触发编译
+  push:
+    branches: [ main, master ] # 往主分支推送代码时自动触发
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    name: Build Release Binary
+    runs-on: windows-latest
+
+    steps:
+      # 1. 拉取代码
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. 安装 Rust 工具链 (指定 Windows 64位 MSVC 目标)
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      # 3. 启用 Rust 编译缓存（极其重要！能将编译时间从 15分钟 缩短到 2分钟）
+      - name: Setup Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          # 缓存键值，若 Cargo.toml 改变则更新缓存
+          shared-key: "windows-x64-build"
+
+      # 4. 如果项目使用了 Tauri (Rust + Node 混合框架) 
+      #    如果该项目是纯 Rust (非 Tauri)，可以把下面这一步(Setup Node)删掉
+      - name: Setup Node.js (Only needed for Tauri GUI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+        continue-on-error: true # 即使没有前端依赖，也允许继续向下执行
+
+      # 5. 执行编译
+      - name: Build Binary
+        shell: bash
+        run: |
+          # 检查是否存在 Cargo.toml
+          if [ ! -f "Cargo.toml" ]; then
+            echo "错误: 未在根目录下找到 Cargo.toml 文件！请确认该项目是否为 Rust 项目。"
+            exit 1
+          fi
+          
+          # 执行 Cargo 编译 (Release 模式，优化性能和体积)
+          echo "正在启动 Cargo 编译..."
+          cargo build --release --target x86_64-pc-windows-msvc
+
+      # 6. 收集并上传编译产物 (.exe 应用程序)
+      - name: Upload Windows x64 Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: nora-windows-x64
+          # 这会收集 target/x86_64-pc-windows-msvc/release/ 目录下所有的 .exe 文件
+          path: |
+            target/x86_64-pc-windows-msvc/release/*.exe
+          # 如果编译产物不在 target 默认目录下（例如 Tauri 在 target/release/bundle/msi ），
+          # 编译完成后你可以根据 GitHub Actions 日志里的路径微调这里的 path。
