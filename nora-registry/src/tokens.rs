@@ -8,6 +8,7 @@ use argon2::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -461,6 +462,11 @@ fn set_file_permissions_600(path: &Path) {
     #[cfg(unix)]
     {
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows 下不作处理，或者使用 Windows 特有的权限控制
+        let _ = path; 
     }
 }
 
